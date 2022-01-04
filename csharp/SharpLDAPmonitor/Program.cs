@@ -14,12 +14,14 @@ namespace SharpLDAPMonitor
 
             var parsed = ArgumentParser.Parse(args);
             Int32 delayInSeconds = 1;
+            String SearchBase = null;
             String username = null;
             String password = null;
             String connectionString = "LDAP://{0}:{1}";
+            Int32 PageSize = 5000;
             DirectoryEntry ldapConnection;
-            SearchResultCollection results_before = null;
-            SearchResultCollection results_after = null;
+            Dictionary<string, ResultPropertyCollection> results_before = null;
+            Dictionary<string, ResultPropertyCollection> results_after = null;
             Logger logger = null;
 
             if (parsed.Arguments.ContainsKey("/logfile"))
@@ -33,12 +35,12 @@ namespace SharpLDAPMonitor
 
 
             logger.WriteLine("[+]======================================================");
-            logger.WriteLine("[+]  Sharp LDAP live monitor v1.1        @podalirius_    ");
+            logger.WriteLine("[+]  Sharp LDAP live monitor v1.3        @podalirius_    ");
             logger.WriteLine("[+]======================================================");
             logger.WriteLine("");
 
             // Display help
-            if (parsed.Arguments.ContainsKey("/help") || parsed.Arguments.ContainsKey("/h") || parsed.Arguments.Count == 0 )
+            if (parsed.Arguments.ContainsKey("/help") || parsed.Arguments.ContainsKey("/h") || parsed.Arguments.Count == 0)
             {
                 logger.WriteLine("Required");
                 logger.WriteLine("   /dcip:<1.1.1.1>    LDAP host to target, most likely the domain controller.");
@@ -47,17 +49,20 @@ namespace SharpLDAPMonitor
                 logger.WriteLine("   /user:<username>   User to authenticate as.");
                 logger.WriteLine("   /pass:<password>   Password of the account.");
                 logger.WriteLine("   /ldaps             Use LDAPS instead of LDAP.");
+                logger.WriteLine("   /searchbase        Sets the LDAP search base.");
                 logger.WriteLine("   /delay:<int>       Delay between two queries in seconds (default: 1).");
                 logger.WriteLine("   /randomize         Randomize delay between two queries, between 1 and 5 seconds.");
                 logger.WriteLine("   /pagesize          Sets the LDAP page size to use in queries (default: 5000).");
+                logger.WriteLine("   /ignoreuserlogons  Ignores user logon events.");
                 logger.WriteLine("   /debug             Debug mode.");
 
                 logger.WriteLine("\nUsage: ldapmonitor.exe /user:DOMAIN\\User /pass:MyP@ssw0rd123! /dcip:192.168.1.1");
                 Environment.Exit(-1);
             }
 
-            // Time delay
+            Boolean ignoreuserlogons = parsed.Arguments.ContainsKey("/ignoreuserlogons");
 
+            // Time delay
             if (!(parsed.Arguments.ContainsKey("/randomize")))
             {
                 if (parsed.Arguments.ContainsKey("/delay"))
@@ -77,7 +82,7 @@ namespace SharpLDAPMonitor
                 Environment.Exit(-1);
             }
 
-            // Handle LDAPS connection
+            // Handle LDAPS connection switch
             if (!parsed.Arguments.ContainsKey("/ldaps"))
             {
                 connectionString = String.Format(connectionString, parsed.Arguments["/dcip"], "389");
@@ -85,6 +90,22 @@ namespace SharpLDAPMonitor
             else
             {
                 connectionString = String.Format(connectionString, parsed.Arguments["/dcip"], "636");
+            }
+
+            // Handle pagesize for LDAP responses
+            if (parsed.Arguments.ContainsKey("/pagesize"))
+            {
+                PageSize = Int32.Parse(parsed.Arguments["/pagesize"]);
+            }
+            else
+            {
+                PageSize = 5000;
+            }
+
+            // Handle 
+            if (parsed.Arguments.ContainsKey("/searchbase"))
+            {
+                SearchBase = parsed.Arguments["/searchbase"];
             }
 
             // Use the provided credentials or the current session
@@ -105,32 +126,24 @@ namespace SharpLDAPMonitor
 
             try
             {
-                // Connect to LDAP
-                ldapConnection = new DirectoryEntry(connectionString, username, password, System.DirectoryServices.AuthenticationTypes.Secure);
-                logger.Debug("Authentication successful!");
+                // Get RootDSE infos (to get list of namingContexts)
+                DirectoryEntry rootDSE = new System.DirectoryServices.DirectoryEntry(String.Format("{0}/RootDSE", connectionString), username, password, System.DirectoryServices.AuthenticationTypes.Secure);
+                List<String> namingContexts = new List<string>();
+                foreach (String nc in rootDSE.Properties["namingContexts"]) { namingContexts.Add(nc); }
 
-                // First query
-                DirectorySearcher searcher = new DirectorySearcher(ldapConnection);
-                if (parsed.Arguments.ContainsKey("/pagesize"))
-                {
-                    searcher.PageSize = Int32.Parse(parsed.Arguments["/pagesize"]);
-                }
-                else
-                {
-                    searcher.PageSize = 5000;
-                }
-                searcher.Filter = "(objectClass=*)";
-                results_before = searcher.FindAll();
+                // First query 
+                logger.Debug("Performing initial query ...");
+                results_before = QueryAllNamingContextsOrSearchBase(namingContexts, connectionString, SearchBase, username, password, PageSize, logger);
 
                 logger.WriteLine("\n[>] Listening for LDAP changes ...");
 
                 while (true)
                 {
                     // Update query
-                    results_after = searcher.FindAll();
+                    results_after = QueryAllNamingContextsOrSearchBase(namingContexts, connectionString, SearchBase, username, password, PageSize, logger);
 
                     // Diff
-                    diff(results_before, results_after, connectionString, logger);
+                    diff(results_before, results_after, connectionString, logger, ignoreuserlogons);
                     results_before = results_after;
 
                     logger.Debug("Waiting " + delayInSeconds + " second.");
@@ -150,22 +163,73 @@ namespace SharpLDAPMonitor
             }
         }
 
-        static void diff(SearchResultCollection results_before, SearchResultCollection results_after, String connectionString, Logger logger)
+        static Dictionary<string, ResultPropertyCollection> QueryAllNamingContextsOrSearchBase(List<String> namingContexts, String connectionString, String SearchBase, String Username, String Password, int PageSize, Logger logger)
         {
+            DirectoryEntry ldapConnection;
+            DirectorySearcher ldapSearcher;
+            Dictionary<string, ResultPropertyCollection> results = new Dictionary<string, ResultPropertyCollection>();
+
+            if (SearchBase != null)
+            {
+                logger.Debug(String.Format("Using SearchBase: {0}", SearchBase));
+                ldapConnection = new System.DirectoryServices.DirectoryEntry(String.Format("{0}/{1}", connectionString, SearchBase), Username, Password, System.DirectoryServices.AuthenticationTypes.Secure);
+                ldapSearcher = new DirectorySearcher(ldapConnection);
+                ldapSearcher.Filter = "(objectClass=*)";
+
+                foreach (SearchResult item in ldapSearcher.FindAll())
+                {
+                    if (!(results.ContainsKey(item.Path)))
+                    {
+                        results[item.Path] = item.Properties;
+                    }
+                    else
+                    {
+                        logger.Debug(String.Format("[debug] key already exists: {0} (this shouldn't be possible)", item.Path));
+                    }
+                }
+
+                return results;
+            }
+            else
+            {
+                foreach (String nc in namingContexts) {
+                    logger.Debug(String.Format("Using namingContext as search base: {0}", SearchBase));
+                    ldapConnection = new System.DirectoryServices.DirectoryEntry(String.Format("{0}/{1}", connectionString, nc), Username, Password, System.DirectoryServices.AuthenticationTypes.Secure);
+                    ldapSearcher = new DirectorySearcher(ldapConnection);
+                    ldapSearcher.Filter = "(objectClass=*)";
+
+                    foreach(SearchResult item in ldapSearcher.FindAll()) {
+                        if (!(results.ContainsKey(item.Path)))
+                        {
+                            results[item.Path] = item.Properties;
+                        }
+                        else
+                        {
+                            logger.Debug(String.Format("[debug] key already exists: {0} (this shouldn't be possible)", item.Path));
+                        }
+                    }
+                }
+                return results;
+            }
+        }
+
+        /*        static void InitLdapConnection()
+                {
+                     = new DirectoryEntry(connectionString, username, password, System.DirectoryServices.AuthenticationTypes.Secure);
+                    logger.Debug("Authentication successful!");
+                }
+        */
+        static void diff(Dictionary<string, ResultPropertyCollection> dict_results_before, Dictionary<string, ResultPropertyCollection> dict_results_after, String connectionString, Logger logger, Boolean ignoreuserlogons)
+        {
+            List<String> ignore_keys = new List<String>();
+            if (ignoreuserlogons)
+            {
+                ignore_keys.Add("lastlogon");
+                ignore_keys.Add("logoncount");
+            }
+
             String dateprompt = "[" + DateTime.UtcNow.ToString("yyyy/MM/dd hh:mm:ss") + "] ";
-
-            // Convert into dictionnaries
-            Dictionary<string, ResultPropertyCollection> dict_results_before = new Dictionary<string, ResultPropertyCollection>();
-            Dictionary<string, ResultPropertyCollection> dict_results_after = new Dictionary<string, ResultPropertyCollection>();
-            foreach (SearchResult result in results_before)
-            {
-                dict_results_before.Add(result.Path, result.Properties);
-            };
-            foreach (SearchResult result in results_after)
-            {
-                dict_results_after.Add(result.Path, result.Properties);
-            };
-
+ 
             // Get created and deleted entries, and common_keys
             List<String> common_keys = new List<String>();
             foreach (String key in dict_results_before.Keys)
@@ -191,11 +255,17 @@ namespace SharpLDAPMonitor
 
                 foreach (DictionaryEntry prop in dict_results_before[path])
                 {
-                    dict_direntry_before.Add(prop.Key.ToString(), dict_results_before[path][prop.Key.ToString()][0]);
+                    if (!(ignore_keys.Contains(prop.Key.ToString().ToLower())))
+                    {
+                        dict_direntry_before.Add(prop.Key.ToString(), dict_results_before[path][prop.Key.ToString()][0]);
+                    }
                 };
                 foreach (DictionaryEntry prop in dict_results_after[path])
                 {
-                    dict_direntry_after.Add(prop.Key.ToString(), dict_results_after[path][prop.Key.ToString()][0]);
+                    if (!(ignore_keys.Contains(prop.Key.ToString().ToLower())))
+                    {
+                        dict_direntry_after.Add(prop.Key.ToString(), dict_results_after[path][prop.Key.ToString()][0]);
+                    }
                 };
 
                 // Store different values

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# File name          : ldapmonitor.py
+# File name          : pyLDAPmonitor.py
 # Author             : Podalirius (@podalirius_)
-# Date created       : 17 Oct 2021
+# Date created       : 3 Jan 2022
+
 
 import argparse
 import os
@@ -17,6 +18,7 @@ from ldap3.protocol.formatters.formatters import format_sid
 import time
 import datetime
 import re
+from binascii import unhexlify
 
 
 ### Data utils
@@ -115,10 +117,12 @@ class LDAPConsole(object):
         self.__results = {}
         self.logger.debug("Using dn: %s" % self.target_dn)
 
-    def query(self, query, attributes=['*'], quiet=False):
+    def query(self, query, attributes=['*'], notify=False):
         # controls
         # https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/3c5e87db-4728-4f29-b164-01dd7d7391ea
         LDAP_PAGED_RESULT_OID_STRING = "1.2.840.113556.1.4.319"
+        # https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/f14f3610-ee22-4d07-8a24-1bf1466cba5f
+        LDAP_SERVER_NOTIFICATION_OID = "1.2.840.113556.1.4.528"
         results = {}
         try:
             # https://ldap3.readthedocs.io/en/latest/searches.html#the-search-operation
@@ -195,7 +199,7 @@ def init_ldap_connection(target, tls_version, args, domain, username, password, 
     return ldap_server, ldap_session
 
 
-def init_ldap_session(args, domain, username, password, lmhash, nthash):
+def init_ldap_session(logger, args, domain, username, password, lmhash, nthash):
     if args.use_kerberos:
         target = get_machine_name(args, domain)
     else:
@@ -203,6 +207,7 @@ def init_ldap_session(args, domain, username, password, lmhash, nthash):
             target = args.dc_ip
         else:
             target = domain
+    logger.print("[>] Trying to connect to %s ..." % target)
     if args.use_ldaps is True:
         try:
             return init_ldap_connection(target, ssl.PROTOCOL_TLSv1_2, args, domain, username, password, lmhash, nthash)
@@ -370,7 +375,11 @@ def ldap3_kerberos_login(connection, target, user, password, domain='', lmhash='
     return True
 
 
-def diff(last1_query_results, last2_query_results, logger):
+def diff(last1_query_results, last2_query_results, logger, ignore_user_logon=False):
+    ignored_keys = []
+    if ignore_user_logon:
+        ignored_keys.append("lastlogon")
+        ignored_keys.append("logoncount")
     dateprompt = "\x1b[0m[\x1b[96m%s\x1b[0m]" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     common_keys = []
     for key in last2_query_results.keys():
@@ -388,10 +397,11 @@ def diff(last1_query_results, last2_query_results, logger):
         #
         attrs_diff = []
         for p in paths_l1:
-            value_before = dict_path_access(last2_query_results[_dn], p)
-            value_after = dict_path_access(last1_query_results[_dn], p)
-            if value_after != value_before:
-                attrs_diff.append((p, value_after, value_before))
+            if p[-1].lower() not in ignored_keys:
+                value_before = dict_path_access(last2_query_results[_dn], p)
+                value_after = dict_path_access(last1_query_results[_dn], p)
+                if value_after != value_before:
+                    attrs_diff.append((p, value_after, value_before))
         #
         if len(attrs_diff) != 0:
             # Print DN
@@ -428,8 +438,11 @@ def parse_args():
     parser.add_argument("--no-colors", dest="no_colors", action="store_true", default=False, help="No colors mode.")
     parser.add_argument("-l", "--logfile", dest="logfile", type=str, default=None, help="Log file to save output to.")
     parser.add_argument("-s", "--page-size", dest="page_size", type=int, default=1000, help="Page size.")
+    parser.add_argument("-S", "--search-base", dest="search_base", type=str, default=None, help="Search base.")
     parser.add_argument("-r", "--randomize-delay", dest="randomize_delay", action="store_true", default=False, help="Randomize delay between two queries, between 1 and 5 seconds.")
     parser.add_argument("-t", "--time-delay", dest="time_delay", type=int, default=1, help="Delay between two queries in seconds (default: 1).")
+    parser.add_argument("--ignore-user-logon", dest="ignore_user_logon", action="store_true", default=False, help="Ignores user logon events.")
+    # parser.add_argument("-n", "--notify", dest="notify", action="store_true", default=False, help="Uses LDAP_SERVER_NOTIFICATION_OID to get only changed objects. (useful for large domains).")
 
     authconn = parser.add_argument_group('authentication & connection')
     authconn.add_argument('--dc-ip', dest="dc_ip", action='store', metavar="ip address", help='IP Address of the domain controller or KDC (Key Distribution Center) for Kerberos. If omitted it will use the domain part (FQDN) specified in the identity parameter')
@@ -451,11 +464,28 @@ def parse_args():
     return args
 
 
+def query_all_naming_contexts(ldap_server, ldap_session, logger, page_size, search_base=None):
+    results = {}
+    if search_base is not None:
+        naming_contexts = [search_base]
+    else:
+        naming_contexts = ldap_server.info.naming_contexts
+    for nc in naming_contexts:
+        lc = LDAPConsole(ldap_server, ldap_session, nc, logger=logger, page_size=page_size)
+        _r = lc.query("(objectClass=*)", attributes=['*'])
+        for key in _r.keys():
+            if key not in results:
+                results[key] = _r[key]
+            else:
+                print("[debug] key already exists: %s (this shouldn't be possible)" % key)
+    return results
+
+
 if __name__ == '__main__':
     args = parse_args()
     logger = Logger(debug=args.debug, nocolors=args.no_colors, logfile=args.logfile)
     logger.print("[+]======================================================")
-    logger.print("[+]    LDAP live monitor v1.1        @podalirius_        ")
+    logger.print("[+]    LDAP live monitor v1.3        @podalirius_        ")
     logger.print("[+]======================================================")
     logger.print()
 
@@ -469,6 +499,7 @@ if __name__ == '__main__':
             auth_nt_hash = args.auth_hashes
     try:
         ldap_server, ldap_session = init_ldap_session(
+            logger=logger,
             args=args,
             domain=args.auth_domain,
             username=args.auth_username,
@@ -478,13 +509,8 @@ if __name__ == '__main__':
         )
 
         logger.debug("Authentication successful!")
-        if "." not in args.auth_domain:
-            args.auth_domain += ".local"
-        dn = ','.join(["DC=%s" % part for part in args.auth_domain.split('.')])
 
-        lc = LDAPConsole(ldap_server, ldap_session, dn, logger=logger, page_size=args.page_size)
-
-        last2_query_results = lc.query("(objectClass=*)", attributes=['*'])
+        last2_query_results = query_all_naming_contexts(ldap_server, ldap_session, logger, args.page_size, args.search_base)
         last1_query_results = last2_query_results
 
         logger.print("[>] Listening for LDAP changes ...")
@@ -498,8 +524,9 @@ if __name__ == '__main__':
             time.sleep(delay)
             #
             last2_query_results = last1_query_results
-            last1_query_results = lc.query("(objectClass=*)", attributes=['*'])
-            diff(last1_query_results, last2_query_results, logger=logger)
+            last1_query_results = query_all_naming_contexts(ldap_server, ldap_session, logger, args.page_size)
+            #
+            diff(last1_query_results, last2_query_results, logger=logger, ignore_user_logon=args.ignore_user_logon)
 
     except Exception as e:
         raise e
