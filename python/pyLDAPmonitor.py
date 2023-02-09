@@ -376,7 +376,7 @@ def ldap3_kerberos_login(connection, target, user, password, domain='', lmhash='
 
 
 def diff(last1_query_results, last2_query_results, logger, ignore_user_logon=False):
-    ignored_keys = []
+    ignored_keys = ["dnsRecord", "replUpToDateVector", "repsFrom"]
     if ignore_user_logon:
         ignored_keys.append("lastlogon")
         ignored_keys.append("logoncount")
@@ -388,7 +388,7 @@ def diff(last1_query_results, last2_query_results, logger, ignore_user_logon=Fal
         else:
             logger.print("%s \x1b[91m'%s' was deleted.\x1b[0m" % (dateprompt, key))
     for key in last1_query_results.keys():
-        if key not in last2_query_results.keys():
+        if key not in last2_query_results.keys() and key not in ignored_keys:
             logger.print("%s \x1b[92m'%s' was added.\x1b[0m" % (dateprompt, key))
     #
     for _dn in common_keys:
@@ -409,6 +409,8 @@ def diff(last1_query_results, last2_query_results, logger, ignore_user_logon=Fal
             for _ad in attrs_diff:
                 path, value_after, value_before = _ad
                 attribute_path = "─>".join(["\"\x1b[93m%s\x1b[0m\"" % attr for attr in path])
+                if any([ik in path for ik in ignored_keys]):
+                    continue
                 if type(value_before) == list:
                     value_before = [
                         v.strftime("%Y-%m-%d %H:%M:%S")
